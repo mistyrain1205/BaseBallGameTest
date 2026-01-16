@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Premium Baseball Simulator</title>
+    <link rel="stylesheet" href="style.css?v=20240116_9">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Outfit:wght@600&display=swap"
+        rel="stylesheet">
+</head>
+
+<body>
+    <div id="setup-screen" class="setup-container">
+        <div id="team-selection-view" class="setup-view">
+            <h2 id="selection-title">自分のチームを選択</h2>
+            <div id="team-list" class="team-grid">
+                <!-- チームカードがここに生成される -->
+            </div>
+            <div id="opponent-selection" class="hidden">
+                <h2>対戦相手を選択</h2>
+                <div id="opponent-list" class="team-grid"></div>
+            </div>
+        </div>
+
+        <div id="lineup-view" class="setup-view hidden">
+            <h2>スタメン・先発投手設定 (ドラッグして配置)</h2>
+            <div class="lineup-setup-container">
+                <div class="lineup-list-section">
+                    <h3>打順スロット</h3>
+                    <div id="lineup-slots" class="drop-zone-container">
+                        <!-- JSで生成: 1番から9番までのスロット -->
+                    </div>
+                </div>
+                <div class="pitcher-bench-section">
+                    <h3>先発投手スロット</h3>
+                    <div id="starter-slot" class="pitcher-slot drop-target" data-slot="starter">
+                        <div class="slot-placeholder">投手をドラッグ</div>
+                    </div>
+                    <h3>ベンチ選手 (クリックで詳細)</h3>
+                    <div id="bench-list" class="player-grid-small drag-source-container">
+                        <!-- ここに全選手が表示される -->
+                    </div>
+                    <div class="setup-controls-mini">
+                        <button id="btn-auto-lineup" class="btn secondary">お勧めオーダー</button>
+                    </div>
+                </div>
+            </div>
+            <div class="setup-controls">
+                <button id="btn-back-to-team" class="btn secondary">チーム選択に戻る</button>
+                <button id="btn-start-game" class="btn primary" disabled>試合開始！</button>
+            </div>
+        </div>
+
+        <!-- 選手詳細表示用モーダル -->
+        <div id="player-detail-modal" class="modal-overlay hidden">
+            <div class="modal-content player-detail-content">
+                <div id="player-detail-body"></div>
+                <button class="btn primary"
+                    onclick="document.getElementById('player-detail-modal').classList.add('hidden')">閉じる</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="game-screen" class="app-container hidden">
+        <header id="game-header">
+            <div class="scoreboard-container">
+                <div class="team-score away">
+                    <span class="team-name">AWAY</span>
+                    <span class="score-value" id="score-away">0</span>
+                </div>
+                <div class="center-box">
+                    <div class="inning-info">
+                        <span id="inning-text">1回表</span>
+                    </div>
+                    <div class="out-count">
+                        O: <span id="outs-container"></span>
+                    </div>
+                </div>
+                <div class="team-score home">
+                    <span class="score-value" id="score-home">0</span>
+                    <span class="team-name">HOME</span>
+                </div>
+            </div>
+        </header>
+
+        <main>
+            <div class="field-container">
+                <div class="diamond" id="diamond-field">
+                    <div class="base" id="base-2"></div>
+                    <div class="base" id="base-3"></div>
+                    <div class="base" id="base-1"></div>
+                    <div class="home-plate"></div>
+
+                    <!-- 守備レイヤー -->
+                    <div class="fielders-layer" id="fielders-layer">
+                        <!-- ここに全9ポジションのマーカーをJSで生成 -->
+                    </div>
+
+                    <!-- ボールと着弾点 -->
+                    <div class="ball-layer">
+                        <div id="hit-spot" class="hit-spot hidden"></div>
+                        <div id="ball-possession" class="game-ball hidden"></div>
+                    </div>
+
+                    <div class="runners">
+                        <div class="runner-container" id="runner-1-container">
+                            <div class="runner-dot"></div>
+                            <div class="runner-name" id="runner-1-name"></div>
+                        </div>
+                        <div class="runner-container" id="runner-2-container">
+                            <div class="runner-dot"></div>
+                            <div class="runner-name" id="runner-2-name"></div>
+                        </div>
+                        <div class="runner-container" id="runner-3-container">
+                            <div class="runner-dot"></div>
+                            <div class="runner-name" id="runner-3-name"></div>
+                        </div>
+                    </div>
+                </div>
+                <div id="score-effect" class="score-effect">GOAL!</div>
+            </div>
+
+            <div class="log-container">
+                <h3>実況ログ</h3>
+                <div id="game-log" class="game-log"></div>
+            </div>
+        </main>
+
+        <footer>
+            <div id="tactical-controls" class="controls">
+                <!-- 投手用・打者用でボタンセットを切り替える -->
+                <div id="pitcher-commands" class="command-group hidden">
+                    <button class="btn cmd-kiwadoi" onclick="game.issueCommand('Pitcher', 'Kiwadoi')">際どい</button>
+                    <button class="btn cmd-strike" onclick="game.issueCommand('Pitcher', 'Strike')">ストライク中心</button>
+                    <button class="btn cmd-hazuse" onclick="game.issueCommand('Pitcher', 'Hazuse')">外せ</button>
+                    <button class="btn cmd-kensei" onclick="game.issueCommand('Pitcher', 'Kensei')">牽制</button>
+                    <button class="btn cmd-auto" onclick="game.issueCommand('Pitcher', 'Auto')">お任せ</button>
+                    <button class="btn cmd-time" onclick="game.openTimeMenu()">タイム</button>
+                </div>
+                <div id="batter-commands" class="command-group hidden">
+                    <button class="btn cmd-aggressive" onclick="game.issueCommand('Batter', 'Aggressive')">積極的</button>
+                    <button class="btn cmd-look" onclick="game.issueCommand('Batter', 'Look')">見ていけ</button>
+                    <button class="btn cmd-bunt" onclick="game.issueCommand('Batter', 'Bunt')">バント</button>
+                    <button class="btn cmd-steal" onclick="game.issueCommand('Batter', 'Steal')">盗塁</button>
+                    <button class="btn cmd-auto" onclick="game.issueCommand('Batter', 'Auto')">お任せ</button>
+                    <button class="btn cmd-time" onclick="game.openTimeMenu()">タイム</button>
+                </div>
+            </div>
+            <div class="batter-info">
+                <p>現在の打者: <span id="current-batter">-</span></p>
+                <p>投手: <span id="current-pitcher">-</span> (<span id="pitch-count">0</span>球 / スタミナ: <span
+                        id="pitcher-stamina">-</span>)</p>
+            </div>
+        </footer>
+    </div>
+
+    <!-- タイムメニューモーダル -->
+    <div id="time-menu-modal" class="modal-overlay hidden">
+        <div class="modal-content">
+            <h2 class="menu-title">タイム</h2>
+            <div class="menu-grid">
+                <button class="menu-item" onclick="game.showBullpen()">
+                    <span class="icon">♨️</span>
+                    <span class="label">ブルペン</span>
+                </button>
+                <button class="menu-item" onclick="game.showSubstitution()">
+                    <span class="icon">🔄</span>
+                    <span class="label">選手の交代</span>
+                </button>
+                <button class="menu-item" onclick="game.showStats()">
+                    <span class="icon">📊</span>
+                    <span class="label">能力確認</span>
+                </button>
+                <button class="menu-item resign" onclick="game.resign()">
+                    <span class="icon">🏳️</span>
+                    <span class="label">投了</span>
+                </button>
+            </div>
+            <div id="time-menu-content" class="menu-sub-view hidden">
+                <div id="bullpen-view" class="sub-view hidden">
+                    <h3>ブルペン指示</h3>
+                    <div id="bullpen-list" class="bullpen-list"></div>
+                </div>
+                <div id="sub-view" class="sub-view hidden">
+                    <h3>選手交代</h3>
+                    <div id="sub-list" class="sub-list"></div>
+                </div>
+                <div id="stats-view" class="sub-view hidden">
+                    <h3>能力確認</h3>
+                    <div id="stats-display" class="stats-display"></div>
+                </div>
+                <button class="btn secondary back-to-menu" onclick="game.hideSubView()">戻る</button>
+            </div>
+            <button id="btn-close-time" class="btn primary" onclick="game.closeTimeMenu()">試合に戻る</button>
+        </div>
+    </div>
+    <script src="script.js?v=20240116_9"></script>
+</body>
+
+</html>

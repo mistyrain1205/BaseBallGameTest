@@ -37,7 +37,8 @@ const TEAM_DATA = {
         ],
         fielders: [
             { name: "バース", pos: "一", meet: 92, power: 98, speed: 40 },
-            { name: "岡田 彰布", pos: "二", meet: 82, power: 85, speed: 55 }
+            { name: "中野 拓海", pos: "二", meet: 68, power: 47, speed: 72 },
+            { name: "戸田 優希", pos: "遊", meet: 56, power: 38, speed: 82 }
         ]
     }
 };

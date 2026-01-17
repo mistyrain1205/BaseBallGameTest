@@ -28,7 +28,9 @@ const TEAM_DATA = {
         ],
         fielders: [
             { name: "岡本 和夫", pos: "一", meet: 73, power: 85, speed: 46 },
-            { name: "吉川 直弥", pos: "二", meet: 82, power: 52, speed: 81 }
+            { name: "吉川 直弥", pos: "二", meet: 82, power: 52, speed: 81 },
+            { name: "森光 一輝", pos: "一", meet: 68, power: 47, speed: 72 },
+
         ]
     },
     1: { // 大阪タイガース
@@ -39,6 +41,15 @@ const TEAM_DATA = {
             { name: "バース", pos: "一", meet: 92, power: 98, speed: 40 },
             { name: "中野 拓海", pos: "二", meet: 68, power: 47, speed: 72 },
             { name: "戸田 優希", pos: "遊", meet: 56, power: 38, speed: 82 }
+        ]
+    },
+    2: { // 名古屋ドラゴンズ
+        pitchers: [
+
+        ],
+        fielders: [
+            { name: "田中 宗", pos: "一", meet: 25, power: 95, speed: 34 }
+
         ]
     }
 };
@@ -1029,13 +1040,60 @@ class BaseballSimulation {
         this.addDropEventListeners(starterSlot);
 
         const benchList = document.getElementById('bench-list');
+        if (!benchList) return;
         benchList.innerHTML = '';
-        this.allAvailablePlayers.forEach(p => {
+
+        // ベンチ選手の表示準備（ポジション順にソート）
+        const posOrder = { "投": 0, "捕": 1, "一": 2, "二": 3, "三": 4, "遊": 5, "左": 6, "中": 7, "右": 8 };
+        const sortedPlayers = (this.allAvailablePlayers || []).sort((a, b) => {
+            if (posOrder[a.mainPos] !== posOrder[b.mainPos]) {
+                return posOrder[a.mainPos] - posOrder[b.mainPos];
+            }
+            return (b.overallRank || "").localeCompare(a.overallRank || "");
+        });
+
+        // 守備位置の自動割り当てシミュレーション (DH判定用)
+        const assignedPosMap = new Map();
+        const posOrderArr = ["捕", "一", "二", "三", "遊", "左", "中", "右"];
+
+        if (this.starter) {
+            // まずはラインナップにいる選手を割り当てる
+            this.lineup.forEach(player => {
+                if (player && !assignedPosMap.has(player)) {
+                    // 優先順位: 本職 -> まだ割り当てられていないポジション
+                    const preferredPos = posOrderArr.find(pos => player.mainPos === pos && !Array.from(assignedPosMap.values()).includes(pos));
+                    if (preferredPos) {
+                        assignedPosMap.set(player, preferredPos);
+                    }
+                }
+            });
+
+            // 残りのラインナップ選手に空いているポジションを割り当てる
+            this.lineup.forEach(player => {
+                if (player && !assignedPosMap.has(player)) {
+                    const availablePos = posOrderArr.find(pos => !Array.from(assignedPosMap.values()).includes(pos));
+                    if (availablePos) {
+                        assignedPosMap.set(player, availablePos);
+                    }
+                }
+            });
+        }
+
+        sortedPlayers.forEach(p => {
             if (this.lineup.includes(p) || this.starter === p) return;
             const card = document.createElement('div');
             card.className = `player-card-mini ${p.colorClass}`;
             card.draggable = true;
-            card.innerHTML = `<span>${p.mainPos}</span><strong>${p.name}</strong>`;
+
+            // 投手の適性表示
+            let aptitudeTag = "";
+            if (p.mainPos === "投") {
+                const roleAbbr = p.pitcherRole === "先発" ? "先" : (p.pitcherRole === "抑え" ? "抑" : "中");
+                const roleClass = p.pitcherRole === "先発" ? "role-starter" : (p.pitcherRole === "抑え" ? "role-closer" : "role-reliever");
+                aptitudeTag = `<span class="aptitude-tag ${roleClass}">${roleAbbr}</span>`;
+            }
+
+            card.innerHTML = `<span class="assigned-pos">${p.mainPos}</span><strong>${p.name}</strong>${aptitudeTag}`;
             card.onclick = () => this.showPlayerDetail(p);
             card.ondragstart = (e) => {
                 e.dataTransfer.setData('text/plain', p.id);
@@ -1045,12 +1103,41 @@ class BaseballSimulation {
             benchList.appendChild(card);
         });
 
-        document.getElementById('btn-start-game').disabled = !(this.lineup.every(p => p !== null) && this.starter !== null);
+        // スロット内の表示更新
+        const slotsEl = document.querySelectorAll('#lineup-slots .slot');
+        const roleLabels = ["1番：リードオフ", "2番：つなぎ", "3番：最強打者", "4番：主砲", "5番：ポイントG", "6番：下位起点", "7番：下位", "8番：下位", "9番：つなぎ2"];
+        slotsEl.forEach((slot, i) => {
+            const p = this.lineup[i];
+            const content = slot.querySelector('.slot-content');
+            if (p) {
+                const assigned = assignedPosMap.get(p) || "指";
+                content.innerHTML = `
+                    <div class="player-card-mini ${p.colorClass}" draggable="true" ondragstart="event.dataTransfer.setData('text/plain', '${p.id}')" onclick="game.showPlayerDetail('${p.id}')">
+                        <span class="assigned-pos ${assigned === "指" ? "role-dh" : ""}">${assigned}</span>
+                        <strong>${p.name}</strong>
+                        <div style="font-size:0.6rem; color:var(--text-muted); margin-top:2px;">${roleLabels[i]}</div>
+                    </div>
+                `;
+            } else {
+                content.innerHTML = `<div class="placeholder">選手をドラッグ</div>`;
+            }
+        });
+
+        const btnStart = document.getElementById('btn-start-game');
+        if (btnStart) {
+            btnStart.disabled = !(this.lineup.every(p => p !== null) && this.starter !== null);
+        }
     }
 
     renderMiniCard(p) {
+        let aptitudeTag = "";
+        if (p.mainPos === "投") {
+            const roleAbbr = p.pitcherRole === "先発" ? "先" : (p.pitcherRole === "抑え" ? "抑" : "中");
+            const roleClass = p.pitcherRole === "先発" ? "role-starter" : (p.pitcherRole === "抑え" ? "role-closer" : "role-reliever");
+            aptitudeTag = `<span class="aptitude-tag ${roleClass}">${roleAbbr}</span>`;
+        }
         return `<div class="player-card-mini ${p.colorClass}" draggable="true" ondragstart="event.dataTransfer.setData('text/plain', '${p.id}')" onclick="game.showPlayerDetail('${p.id}')">
-            <span>${p.mainPos}</span><strong>${p.name}</strong>
+            <span>${p.mainPos}</span><strong>${p.name}</strong>${aptitudeTag}
         </div>`;
     }
 
@@ -1095,7 +1182,7 @@ class BaseballSimulation {
                 <span class="pos">${p.mainPos}</span>
                 <div class="player-info-unit">
                     <h3 style="margin-bottom:5px;">${p.name}</h3>
-                    <div class="role-tag" style="opacity:0.8; font-size:0.9rem; margin-bottom:15px;">${p.playerType} / ${p.mainPos}</div>
+                    <div class="role-tag" style="opacity:0.8; font-size:0.9rem; margin-bottom:15px;">${p.playerType === "先発" ? "先発" : p.playerType} / ${p.mainPos}</div>
                 </div>
                 ${p.mainPos !== "投" ? statsHtml : ""}
                 ${extraContent}
@@ -1178,13 +1265,75 @@ class BaseballSimulation {
     }
 
     autoSelectLineup() {
+        const fielders = this.myTeam.players.filter(p => p.mainPos !== "投");
         const pitchers = this.myTeam.players.filter(p => p.mainPos === "投").sort((a, b) => b.velocity - a.velocity);
-        const hitters = this.myTeam.players.filter(p => p.mainPos !== "投").sort((a, b) => b.stats.meet - a.stats.meet);
 
+        // 1. 先発投手の決定
         this.starter = pitchers[0];
-        for (let i = 0; i < 9; i++) {
-            this.lineup[i] = hitters[i] || null;
+
+        const requiredPositions = ["捕", "一", "二", "三", "遊", "左", "中", "右"];
+        let selectedSet = new Set();
+        let positionPlayers = [];
+
+        // 全ポジションを埋めるように選出（打撃能力順）
+        const hittersSorted = [...fielders].sort((a, b) => (b.stats.meet + b.stats.power) - (a.stats.meet + a.stats.power));
+
+        requiredPositions.forEach(pos => {
+            const candidate = hittersSorted.find(p => p.mainPos === pos && !selectedSet.has(p));
+            if (candidate) {
+                positionPlayers.push(candidate);
+                selectedSet.add(candidate);
+            }
+        });
+
+        // もしも埋まりきらなかった場合（通常はないが）
+        requiredPositions.forEach((pos, idx) => {
+            if (!positionPlayers[idx]) {
+                const backup = hittersSorted.find(p => !selectedSet.has(p));
+                if (backup) {
+                    positionPlayers.push(backup);
+                    selectedSet.add(backup);
+                }
+            }
+        });
+
+        // 9人目（指名打者）を選出
+        const dhCandidate = hittersSorted.find(p => !selectedSet.has(p));
+        if (dhCandidate) {
+            positionPlayers.push(dhCandidate);
+            selectedSet.add(dhCandidate);
         }
+
+        // 2. 打順の役割に応じた並び替え
+        const lineup = Array(9).fill(null);
+        let rem = [...positionPlayers];
+
+        // 4番 (主砲): パワー最大
+        rem.sort((a, b) => b.stats.power - a.stats.power);
+        lineup[3] = rem.shift();
+
+        // 3番 (最強打者): 総合力
+        rem.sort((a, b) => (b.stats.meet + b.stats.power + b.stats.speed) - (a.stats.meet + a.stats.power + a.stats.speed));
+        lineup[2] = rem.shift();
+
+        // 1番 (リードオフ): 足
+        rem.sort((a, b) => (b.stats.speed + b.stats.eye) - (a.stats.speed + a.stats.eye));
+        lineup[0] = rem.shift();
+
+        // その他
+        rem.sort((a, b) => (b.stats.speed + b.stats.eye) - (a.stats.speed + a.stats.eye));
+        lineup[5] = rem.shift(); // 6番
+        rem.sort((a, b) => (b.stats.power + b.stats.meet) - (a.stats.power + a.stats.meet));
+        lineup[4] = rem.shift(); // 5番
+        rem.sort((a, b) => (b.stats.bunt + b.stats.meet) - (a.stats.bunt + a.stats.meet));
+        lineup[1] = rem.shift(); // 2番
+        rem.sort((a, b) => (b.stats.speed + b.stats.bunt) - (a.stats.speed + a.stats.bunt));
+        lineup[8] = rem.shift(); // 9番
+        rem.sort((a, b) => b.stats.defense - a.stats.defense);
+        lineup[6] = rem.shift(); // 7番
+        lineup[7] = rem.shift(); // 8番
+
+        this.lineup = lineup;
         this.updateLineupUI();
     }
 

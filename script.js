@@ -48,7 +48,7 @@ const TEAM_DATA = {
 
         ],
         fielders: [
-            { name: "田中 宗", pos: "一", meet: 25, power: 95, speed: 34 }
+            { name: "田中 宗", pos: "一", meet: 39, power: 95, speed: 34 }
 
         ]
     }
@@ -186,6 +186,92 @@ class Player {
     }
 }
 
+class Runner {
+    constructor(player, base) {
+        this.player = player;
+        this.currentBase = base; // 0=Batter, 1=1st, 2=2nd, 3=3rd
+        this.checkPoint = base;  // 安全確保している塁
+        this.distanceFromBase = 0; // リード距離 (ft)
+        this.isForced = false;
+        this.state = 'IDLE'; // IDLE, RUNNING, RETURNING, TAGGING
+
+        // 走力 (0-100) を ft/sec に変換 (概算)
+        // プロ平均: 27ft/s (約8.2m/s)
+        // 1塁到達平均: 4.2秒 (右打者)
+        // 90ft / 4.2s = 21.4 ft/s (スタートロス込み)
+        // 最高速はだいたい 25~30 ft/s
+        this.maxSpeed = 24 + (player.stats.speed * 0.12); // Speed 0->24ft/s, 100->36ft/s
+    }
+
+    get name() { return this.player.name; }
+    get speedStats() { return this.player.stats.speed; }
+
+    // 次の塁までの到達時間を計算 (距離: 90ft)
+    calculateReachTime(targetBase, isTouchUp = false) {
+        let dist = 90;
+        if (isTouchUp) dist = 90; // タッチアップは停止状態から
+        else dist = 90 - this.distanceFromBase;
+
+        // スタートの加速ロス
+        let startLoss = isTouchUp ? 1.0 : 0.5;
+        if (this.state === 'RUNNING') startLoss = 0; // 既に走っていればロスなし
+
+        return (dist / this.maxSpeed) + startLoss;
+    }
+
+    decideAction(battedBall, fielders, outs, runnersMap) {
+        // AI判断ロジック
+        // 1. 打球判断
+        if (battedBall.type === 'Fly') {
+            if (battedBall.hangTime > 3.0 && this.currentBase < 3) {
+                // 滞空時間が長ければハーフウェイ or タッチアップ待機
+                // 3塁ランナーはタッチアップ狙い
+                if (this.currentBase === 3) return 'TAG_UP';
+                // 2塁ランナーは深ければタッチアップ
+                if (this.currentBase === 2 && battedBall.distance > 250) return 'TAG_UP';
+            }
+            return 'HOLD'; // 基本は自重
+        }
+
+        // ゴロ・ライナーの場合
+        if (battedBall.type === 'Grounder') {
+            if (this.isForced) return 'ADVANCE'; // 強制進塁
+            // 判断: 間に合うか？
+            // ... (簡易実装: ゴロならとりあえず進むことが多い)
+            return 'ADVANCE';
+        }
+
+        // ヒット性の当たり
+        if (battedBall.isHit) {
+            return 'ADVANCE';
+        }
+
+        return 'HOLD';
+    }
+}
+
+const BattedBallType = { Grounder: 'Grounder', Fly: 'Fly', LineDrive: 'LineDrive', PopFly: 'PopFly' };
+
+class BattedBall {
+    constructor(type, x, y, hangTime, travelTime, isHit) {
+        this.type = type;
+        this.x = x; // % coordinates
+        this.y = y; // % coordinates
+        this.location = { x, y };
+        this.hangTime = hangTime; // sec
+        this.travelTime = travelTime; // sec (for grounder to reach fielder)
+        this.isHit = isHit;
+
+        // 距離の概算 (ホームベース(50, 100)からの距離%)
+        // ホームは (48.3, 100) あたり
+        const dx = x - 48.3;
+        const dy = y - 100;
+        this.distancePercent = Math.sqrt(dx * dx + dy * dy);
+        // 100% = フェンス (約120m/400ft) と仮定
+        this.distanceFeet = this.distancePercent * 4.0;
+    }
+}
+
 const AtBatResult = { Single: 'ヒット', Double: 'ツーベース', Triple: 'スリーベース', HR: 'ホームラン', BB: 'フォアボール', K: '三振', GroundOut: 'ゴロ', FlyOut: 'フライ', Error: 'エラー', DeadBall: 'デッドボール' };
 
 class Team {
@@ -221,7 +307,11 @@ class GameState {
     constructor() {
         this.scoreHome = 0; this.scoreAway = 0; this.inning = 1; this.isBottom = false;
         this.balls = 0; this.strikes = 0;
-        this.outs = 0; this.runners = [null, null, null, null];
+        this.outs = 0;
+        this.runners = [null, null, null, null]; // Index 0: Batter(temp), 1: 1B, 2: 2B, 3: 3B
+        // NOTE: New Runner objects will be stored here.
+        // this.runners[i] will be an instance of Runner class.
+
         this.batterIdx = 0; this.cpuBatterIdx = 0;
         this.pitcher = null; this.cpuPitcher = null;
         this.bench = []; this.cpuBench = [];
@@ -434,10 +524,7 @@ class GameState {
             case 'StealOut':
                 this.nextHalfInning();
                 return;
-            case 'BuntOut':
-                this.addLog("<span style='color:var(--error-red)'>スリーバント失敗！</span>", "out");
-                this.completeAtBat('StrikeOut', batter, "2ストライクからのバントがファウルとなりました.");
-                return;
+            // BuntOut is handled above
         }
 
         if (this.balls >= 4) {
@@ -453,242 +540,316 @@ class GameState {
     resolveInPlay(batter, pitcher, fielders, bonus = 0, isBunt = false) {
         try {
             const bCmd = this.currentCommand.Batter;
-            const targetPosIndex = rand(9);
-            // Order: P, C, 1B, 2B, 3B, SS, LF, CF, RF matches the defenders array and markers
+
+            // --- 1. 打球の生成 ---
+            const targetPosIndex = rand(9); // P, C, 1B, 2B, 3B, SS, LF, CF, RF
             const targetName = ["ピッチャー", "キャッチャー", "ファースト", "セカンド", "サード", "ショート", "レフト", "センター", "ライト"][targetPosIndex];
             const isInfield = targetPosIndex <= 5;
-            // fielders might be incomplete, handle that safely
-            const fielder = (fielders && fielders[targetPosIndex]) ? fielders[targetPosIndex] : { name: targetName, stats: { defense: 50, shoulder: 50, throwing: 50 } };
+            const fielder = (fielders && fielders[targetPosIndex]) ? fielders[targetPosIndex] : { name: targetName, stats: { defense: 50, shoulder: 50, throwing: 50 } }; // fallback
             const fStats = fielder.stats || { defense: 50, shoulder: 50, throwing: 50 };
 
-            // 1. 打球の「深さ」と「視覚的な座標」を決定
+            // 打球パラメータ
             let hitDepth = isBunt ? (Math.random() * 15 + 5) : (Math.floor(Math.random() * 70) + 20 + (batter.stats.power * 0.1));
             hitDepth = Math.min(100, Math.max(0, hitDepth));
 
-            // 座標計算用のベース位置 (300x300のピクセル位置を%に変換)
-            // Order: P, C, 1B, 2B, 3B, SS, LF, CF, RF
-            const posCoords = [
-                { x: 48.3, y: 49.3 }, // P  (145,148)
-                { x: 48.3, y: 102.6 },// C  (145,308)
-                { x: 80.0, y: 45.0 }, // 1B (240,135)
-                { x: 77.3, y: 16.0 }, // 2B (232,48)
-                { x: 16.6, y: 45.0 }, // 3B (50,135)
-                { x: 19.3, y: 16.0 }, // SS (58,48)
-                { x: 5.0, y: -1.6 },  // LF (15,-5)
-                { x: 48.3, y: -18.3 },// CF (145,-55)
-                { x: 91.6, y: -1.6 }  // RF (275,-5)
-            ];
+            // 打球タイプ決定
+            let ballType = BattedBallType.Grounder;
+            if (!isBunt) {
+                const launchAngle = Math.random() * 90;
+                if (launchAngle > 60) ballType = BattedBallType.PopFly;
+                else if (launchAngle > 25) ballType = BattedBallType.Fly;
+                else if (launchAngle > 10) ballType = BattedBallType.LineDrive;
+            }
 
+            // 座標計算
+            const posCoords = [
+                { x: 48.3, y: 49.3 }, // P
+                { x: 48.3, y: 102.6 },// C
+                { x: 80.0, y: 45.0 }, // 1B
+                { x: 77.3, y: 16.0 }, // 2B
+                { x: 16.6, y: 45.0 }, // 3B
+                { x: 19.3, y: 16.0 }, // SS
+                { x: 5.0, y: -1.6 },  // LF
+                { x: 48.3, y: -18.3 },// CF
+                { x: 91.6, y: -1.6 }  // RF
+            ];
             const baseCoord = posCoords[targetPosIndex] || posCoords[0];
-            // 飛距離に応じて多少のランダム移動を加える
             let ballX = baseCoord.x + (Math.random() * 10 - 5);
             let ballY = baseCoord.y + (Math.random() * 10 - 5);
-            this.updateBallPos(ballX, ballY);
+            this.updateBallPos(ballX, ballY); // Visual update
 
-            if (isBunt) {
-                this.addLog(`<strong>${targetName}</strong> の前に転がした！ (バント)`, "event");
+            // ヒット判定 (簡易版)
+            let isHit = false;
+            let catchProb = 0;
+            // 守備範囲計算
+            let range = fStats.defense * 0.15 + 10; // Basic range
+            if (ballType === BattedBallType.Fly) range += 15; // フライは捕りやすい
+
+            // 捕球難易度 (0-100)
+            let difficulty = Math.random() * 100;
+            if (isInfield && ballType === BattedBallType.PopFly) difficulty = 0; // 内野フライはほぼアウト
+
+            // エラー判定
+            let errorProb = Math.max(0.5, 5.0 - (fStats.defense * 0.05));
+            let isError = (Math.random() * 100 < errorProb);
+
+            if (!isError && difficulty < fStats.defense && hitDepth < 85) {
+                isHit = false; // Out
             } else {
-                const depthText = hitDepth < 40 ? "浅い" : (hitDepth < 70 ? "定位置の" : "深い");
-                this.addLog(`打球は ${!isInfield ? depthText + " " : ""}<strong>${targetName}</strong> への当たり！`, "event");
+                isHit = true; // Hit or Error
+            }
+            if (hitDepth > 85 && !isInfield) isHit = true; // Deep outfield is likely hit
+
+            // ホームラン
+            if (!isInfield && hitDepth > 90 && (Math.random() * 100 < (batter.stats.power * 0.1))) {
+                this.completeAtBat('HomeRun', batter, `打球はスタンドへ！ ホームラン！`);
+                return;
             }
 
-            // ホームラン判定（座標をさらに奥へ）
-            let hrProb = isBunt ? 0 : (2 + (batter.stats.power * 0.05));
-            if (!isInfield && hitDepth > 85 && (Math.random() * 100 < hrProb)) {
-                this.updateBallPos(ballX, ballY - 40); // 観客席方向へ
-                this.completeAtBat('HomeRun', batter, `打球は大きな放物線を描いて${targetName}外野席へ！`);
-                return 'HomeRun';
-            }
+            const battedBall = new BattedBall(
+                ballType, ballX, ballY,
+                (ballType === BattedBallType.Fly ? 4.0 + (hitDepth * 0.02) : 1.5), // HangTime
+                (hitDepth * 0.05), // TravelTime
+                isHit
+            );
 
-            // 2. 捕球判定
-            let defenseThreshold = (targetPosIndex === 7) ? 50 : (!isInfield ? 30 : 0);
-            let pBonus = (bCmd === 'Power') ? 15 : 0;
-            let mBonus = (bCmd === 'Meet') ? 10 : 0;
+            // ログ出力
+            let hitDesc = isBunt ? "バント" : (ballType === BattedBallType.Grounder ? "ゴロ" : (ballType === BattedBallType.Fly ? "フライ" : "ライナー"));
+            this.addLog(`打球は ${targetName} への${hitDesc}`, "event");
 
-            let battedBallQuality = (batter.stats.meet * 0.25) + (batter.stats.power * 0.25) + pBonus + mBonus + bonus + (Math.random() * 40);
-            let catchScore = (fStats.defense * 0.9 - defenseThreshold) + (Math.random() * 25);
+            // --- 2. ランナーの意思決定とタイムラインシミュレーション ---
 
-            // ボールが吸い込まれる（ possession更新）
-            setTimeout(() => {
-                // エラーやヒットでなければ捕球
-                try {
-                    if (!(Math.random() * 100 < (Math.max(0.2, 2.0 - (fStats.throwing + fStats.defense) * 0.01))) && battedBallQuality <= catchScore) {
-                        this.updateBallPos(0, 0, targetPosIndex);
+            // バッターランナー生成
+            const batterRunner = new Runner(batter, 0);
+
+            // 結果格納用
+            let outCountIncrease = 0;
+            let runsScored = 0;
+            let nextRunners = [null, null, null, null]; // 新しい走者配置
+
+            // 守備側の処理時間 (捕って投げるまで)
+            let fieldingTime = battedBall.travelTime + 0.5 + Math.max(0, 2.0 - fStats.defense * 0.02);
+            if (isHit && !isError) fieldingTime += 1.5; // ヒットの場合は中継などでもたつく
+            if (isError) fieldingTime += 2.0;
+
+            // バッターランナーの初期判定
+            // フェアなら走塁開始
+
+            // 各走者の処理 (3塁 -> 1塁の順で解決)
+            // まず既存ランナーの配置をコピーしてシミュレーション
+            let tempRunners = [...this.runners];
+            tempRunners[0] = batterRunner; // バッター走者を0に置く
+
+            // フォース状態の確認
+            if (tempRunners[1]) tempRunners[1].isForced = true;
+            if (tempRunners[1] && tempRunners[2]) tempRunners[2].isForced = true;
+            if (tempRunners[1] && tempRunners[2] && tempRunners[3]) tempRunners[3].isForced = true;
+
+            // バッターのアウト/セーフ判定
+            if (!isHit && !isError) {
+                // 野手が捕球して1塁へ送球
+                let distTo1B = 80; // 野手から1塁への距離 (概算)
+                if (targetPosIndex === 2) distTo1B = 10; // 1Bなら近い
+
+                let throwSpeed = 80 + (fStats.shoulder * 0.5); // ft/sec
+                let throwTime = distTo1B / throwSpeed;
+
+                let batterTime = batterRunner.calculateReachTime(1);
+
+                let totalDefenseTime = fieldingTime + throwTime;
+
+                // フライアウトの場合はバッター自動アウト
+                if (ballType === BattedBallType.Fly || ballType === BattedBallType.PopFly || ballType === BattedBallType.LineDrive) {
+                    this.addLog(`${batter.name}: フライアウト`, "out");
+                    outCountIncrease++;
+                } else {
+                    // ゴロの場合
+                    this.addLog(`<small>Batter Time: ${batterTime.toFixed(2)}s vs Defense: ${totalDefenseTime.toFixed(2)}s</small>`, "neutral");
+
+                    if (totalDefenseTime < batterTime) {
+                        this.addLog(`${batter.name}: 1塁アウト！`, "out");
+                        outCountIncrease++;
+                    } else {
+                        this.addLog(`${batter.name}: 内野安打！ 足が勝った！`, "hit");
+                        nextRunners[1] = batterRunner;
+                        batterRunner.currentBase = 1;
                     }
-                } catch (e) {
-                    console.error("Ball pos error:", e);
                 }
-            }, 300);
-
-            // キャッチエラー
-            let errorBase = Math.max(0.2, 2.0 - (fStats.throwing + fStats.defense) * 0.01);
-            if (Math.random() * 100 < errorBase) {
-                this.completeAtBat('Error', batter, `あっと！ ${targetName} がファンブル！ エラーで出塁！`, fielder);
-                return 'Error';
-            }
-
-            if (battedBallQuality > catchScore) {
-                // ヒット確定 (ボールを野手のさらに奥へ)
-                this.updateBallPos(ballX + (Math.random() * 20 - 10), ballY - 20);
-                let desc = (hitDepth > 70 && !isInfield) ? `${targetName}の頭上を越えた！ 長打コース！` : `鋭い打球が ${targetName} の横を抜けた！ ヒット！`;
-                let hitType = 'Single';
-                if (!isInfield) {
-                    if (hitDepth > 70 && batter.stats.speed > 60) hitType = 'Double';
-                    else if (hitDepth > 90 && batter.stats.speed > 80) hitType = 'Triple';
-                }
-                this.completeAtBat(hitType, batter, desc, fielder, targetPosIndex, hitDepth);
-                return hitType;
-            }
-
-            // 3. アウトまたは送球
-            if (!isInfield) {
-                let desc = (catchScore - battedBallQuality < 15) ? `背走して... ${targetName} がナイスキャッチ！` : `${targetName} が落下点に入ってアウト。`;
-                this.addLog(`<em>${desc}</em>`, "event");
-                this.updateBallPos(0, 0, targetPosIndex); // 確実に捕球
-
-                // タッチアップ判定
-                if (this.runners[3] && this.outs < 2) {
-                    const tagUpRes = this.checkTagUp(this.runners[3], fielder, hitDepth, targetPosIndex);
-                    if (tagUpRes === 1) {
-                        if (this.isBottom) this.scoreHome++; else this.scoreAway++;
-                        this.runners[3] = null;
-                        this.triggerScoreEffect(1);
-                        this.addLog(`<span style="color:var(--accent-gold)">+1点！ (タッチアップ)</span>`, "event");
-                    } else if (tagUpRes === 2) {
-                        this.runners[3] = null;
-                        this.outs++;
+            } else { // Hit or Error
+                let resultStr = isError ? "エラー" : "ヒット";
+                this.addLog(`${batter.name}: ${resultStr}で出塁`, isError ? "event" : "hit");
+                // 長打判定
+                if (!isInfield && hitDepth > 70) {
+                    // 2塁打コース
+                    let reach2BTime = batterRunner.calculateReachTime(1) + batterRunner.calculateReachTime(2);
+                    // 守備側はボールを処理して2塁へ
+                    let distTo2B = 150;
+                    let throwTime = distTo2B / (80 + fStats.shoulder * 0.5);
+                    if (fieldingTime + throwTime > reach2BTime - 0.5) { // 少し余裕を持って
+                        this.addLog("ツーベースヒット！", "hit");
+                        nextRunners[2] = batterRunner;
+                        batterRunner.currentBase = 2;
+                    } else {
+                        nextRunners[1] = batterRunner;
+                        batterRunner.currentBase = 1;
                     }
+                } else {
+                    nextRunners[1] = batterRunner;
+                    batterRunner.currentBase = 1;
                 }
-                this.completeAtBat('Out', batter, "", fielder);
-                return 'Out';
             }
 
-            this.addLog(`${targetName} が捕って一塁へ送球！`, "event");
-            this.updateBallPos(0, 0, targetPosIndex);
+            // 既存ランナーの進塁判定
+            for (let i = 3; i >= 1; i--) {
+                let r = this.runners[i];
+                if (!r) continue;
 
-            let throwErrorProb = Math.max(0.1, 3.0 - (fStats.throwing * 0.025));
-            if (Math.random() * 100 < throwErrorProb) {
-                // 送球エラー (ボールを明後日の方向へ)
-                this.updateBallPos(90, 80);
-                this.completeAtBat('Error', batter, "あっと！ 送球が逸れた！ ファースト取れない！ エラー！！", fielder);
-                return 'Error';
+                // フライ時のタッチアップ処理
+                if ((ballType === BattedBallType.Fly || ballType === BattedBallType.PopFly) && !isHit && outCountIncrease > 0 && this.outs < 2) {
+                    if (i === 3) { // 3塁ランナー
+                        let reachHomeTime = r.calculateReachTime(4, true); // true = start from stop
+                        let distFielderToHome = battedBall.distanceFeet;
+                        let throwSpeed = 85 + (fStats.shoulder * 0.5);
+                        let throwTime = distFielderToHome / throwSpeed;
+
+                        // 捕球後スタート
+                        let totalDefenseTime = battedBall.hangTime + 0.5 + throwTime;
+                        let totalRunnerTime = battedBall.hangTime + reachHomeTime; // 同時スタートだが、捕球までは待機なので実質比較はこうなる
+
+                        // 実際は「捕球確認」->「スタート」
+                        // マージン判定
+                        let margin = (throwTime + 0.5) - reachHomeTime; // +0.5は野手の持ち替え時間など
+
+                        if (margin > -0.2 && battedBall.distanceFeet > 200) { // ある程度深ければ
+                            this.addLog(`${r.name}: タッチアップ！`, "event");
+                            if (margin > 0) {
+                                runsScored++;
+                                this.addLog("セーフ！ ホームイン！", "event");
+                            } else {
+                                this.addLog("本塁タッチアウト！ ダブルプレー！", "out");
+                                outCountIncrease++;
+                            }
+                        } else {
+                            this.addLog(`${r.name}: 3塁ステイ。`, "neutral");
+                            nextRunners[3] = r;
+                        }
+                    } else {
+                        nextRunners[i] = r; // 他のランナーは戻る
+                    }
+                    continue;
+                }
+
+                // 通常の進塁処理
+                // 強制進塁なら進む
+                if (r.isForced && outCountIncrease === 0) {
+                    // バッターがセーフなら押し出される
+                    let target = i + 1;
+                    if (target > 3) {
+                        runsScored++;
+                        this.addLog(`${r.name}: ホームイン！`, "event");
+                    } else {
+                        nextRunners[target] = r;
+                        r.currentBase = target;
+                    }
+                } else if (!isHit && outCountIncrease > 0) {
+                    // バッターアウト（ゴロ）
+                    // 併殺崩れ等の判定は省略し、基本的に進めないこととする（フォースでなければ）
+                    // 2アウトなら進んでも無駄だが、一応
+                    if (r.isForced) {
+                        // 併殺判定を入れるべきだが、今回はセーフ（進塁）にする
+                        let target = i + 1;
+                        if (target > 3) runsScored++;
+                        else { nextRunners[target] = r; r.currentBase = target; }
+                    } else {
+                        // 盗塁などでなければ戻る
+                        nextRunners[i] = r;
+                    }
+                } else if (isHit) {
+                    // ヒット時の進塁
+                    // 2塁ランナーのホーム突入など
+                    if (i === 2) {
+                        // 単打でホームへ行けるか？
+                        let reachHomeTime = r.calculateReachTime(3) + r.calculateReachTime(4);
+                        let throwTime = battedBall.distanceFeet / (80 + fStats.shoulder * 0.5);
+                        let margin = (fieldingTime + throwTime) - reachHomeTime;
+
+                        if (margin > 0 && !isInfield) {
+                            this.addLog(`${r.name}: 2塁から一気にホームへ！`, "event");
+                            runsScored++;
+                        } else {
+                            this.addLog(`${r.name}: 3塁でストップ。`, "neutral");
+                            nextRunners[3] = r;
+                            r.currentBase = 3;
+                        }
+                    } else if (i === 1) {
+                        // 1塁ランナー -> 3塁へ
+                        if (!isInfield && hitDepth > 60) {
+                            // 3塁へ行けるか？
+                            let reach3BTime = r.calculateReachTime(2) + r.calculateReachTime(3);
+                            let throwTime = Math.abs(battedBall.distanceFeet - 90) / (80 + fStats.shoulder * 0.5); // 3塁への距離概算
+                            if ((fieldingTime + throwTime) > reach3BTime) {
+                                this.addLog(`${r.name}: 3塁へ到達！`, "event");
+                                nextRunners[3] = r;
+                                r.currentBase = 3;
+                            } else {
+                                nextRunners[2] = r;
+                                r.currentBase = 2;
+                            }
+                        } else {
+                            nextRunners[2] = r;
+                            r.currentBase = 2;
+                        }
+                    } else if (i === 3) {
+                        runsScored++;
+                        this.addLog(`${r.name}: ホームイン`, "event");
+                    }
+                } else {
+                    // ここに来るのは稀だが、現状維持
+                    nextRunners[i] = r;
+                }
             }
 
-            let runnerScore = batter.stats.speed + (Math.random() * 25);
-            let throwScore = 45 + (fStats.shoulder * 0.65) + ((catchScore - battedBallQuality) * 0.2) + (Math.random() * 15);
+            // 3. 結果反
+            this.runners = nextRunners;
+            this.outs += outCountIncrease;
 
-            // 送球アニメーション（一塁手へ）
-            setTimeout(() => this.updateBallPos(0, 0, 2), 200); // Index 2 is 1B
+            if (runsScored > 0) {
+                if (this.isBottom) this.scoreHome += runsScored;
+                else this.scoreAway += runsScored;
+                this.triggerScoreEffect(runsScored);
+            }
 
-            if (throwScore > runnerScore) {
-                let desc = (throwScore - runnerScore < 15) ? "際どいタイミング... アウト！ ナイスプレー！" : "余裕を持ってアウト。";
-                this.completeAtBat('Out', batter, desc, fielder);
-                return 'Out';
+            // 完了メッセージなどは completeAtBat に任せずにここで処理してUI更新だけ呼ぶ
+            // 互換性のため completeAtBat は使用せず、直接UI更新へ
+
+            // 3アウトチェンジ判定
+            if (this.outs >= 3) {
+                this.nextHalfInning();
             } else {
-                let desc = (runnerScore - throwScore < 15) ? "間一髪セーフ！ 足が勝った！ 内野安打！" : "深い当たり！ 投げられない！ 内野安打。";
-                this.completeAtBat('Single', batter, desc, fielder);
-                return 'Single';
+                if (this.isBottom) this.batterIdx = (this.batterIdx + 1) % 9;
+                else this.cpuBatterIdx = (this.cpuBatterIdx + 1) % 9;
             }
+
+            // Reset commands to Auto for next batter
+            this.currentCommand = { Pitcher: 'Auto', Batter: 'Auto' };
+            this.updateUI();
+
         } catch (e) {
             console.error("ResolveInPlay Error:", e);
-            this.addLog(`System Error: ${e.message}`, "error");
-            return 'Single'; // Layout fallback
+            if (this.addLog) this.addLog(`System Error: ${e.message}`, "error");
+            // フォールバック: 次の打者へ
+            if (this.isBottom) this.batterIdx = (this.batterIdx + 1) % 9;
+            else this.cpuBatterIdx = (this.cpuBatterIdx + 1) % 9;
+            this.updateUI();
         }
     }
 
-    checkTagUp(runner, fielder, flyDepth, posIndex) {
-        this.addLog(`>> 3塁ランナー <strong>${runner.name}</strong>、タッチアップの構え！`, "event");
+    // Helper methods (checkTagUp, etc) removed/merged into resolveInPlay or obsolete
 
-        // ポジション補正 (6=レフト, 7=センター, 8=ライト)
-        let shoulderWeight = 0;
-        if (posIndex === 6) shoulderWeight = -15; // 近い (より刺されやすい)
-        else if (posIndex === 8) shoulderWeight = 25; // 遠い (よりセーフになりやすい)
+    // Legacy support wrapper (if needed)
+    completeAtBat(res, batter, detail = "", fielder = null) {
+        // This is still used by StrikeOut, Walk, HomeRun in processPitchResult
 
-        if (flyDepth < 40) { // 浅いフライの基準を厳しく
-            this.addLog(">> 浅いフライだ。ランナー動けない！", "event");
-            return 0;
-        }
-        // 判断基準をより慎重に (flyDepth + speedの影響を調整)
-        if ((flyDepth * 0.7 + runner.stats.speed * 0.4) < 70) {
-            this.addLog(">> 無理はしない。3塁に留まる。", "event");
-            return 0;
-        }
-        this.addLog(">> スタートを切った！ 本塁へ突っ込む！", "event");
-
-        let runnerScore = flyDepth + runner.stats.speed + (Math.random() * 25);
-        let throwMod = (fielder.stats.throwing > 70) ? 10 : -10;
-        let defenseScore = fielder.stats.shoulder + 65 + throwMod - shoulderWeight + (Math.random() * 20);
-
-        if (runnerScore > defenseScore) {
-            this.addLog(runnerScore - defenseScore < 15 ? ">> 際どいタイミング... セーフ！！ ホームイン！" : ">> 送球間に合わない！ 余裕でセーフ！", "event");
-            return 1;
-        } else {
-            // 野手の送球ミスによるセーフ
-            if (Math.random() * 100 > (fielder.stats.throwing + 20)) {
-                this.addLog(">> あっと！ 返球が逸れた！ その間にホームイン！", "event");
-                return 1;
-            }
-            this.addLog(">> ストライク送球！ タッチアウト！！ 補殺完成！", "out");
-            return 2;
-        }
-    }
-
-    checkExtraBase(runner, fielder, hitType, posIndex = -1, hitDepth = 50) {
-        let difficulty = 50, message = "";
-
-        // ポジション補正 (6=レフト, 7=センター, 8=ライト)
-        let shoulderWeight = 0;
-        if (posIndex === 6) shoulderWeight = -15; // 3塁に刺しにくい（近い）が、その分油断できない
-        else if (posIndex === 8) shoulderWeight = 25; // 3塁に刺しやすい（遠い）
-
-        if (hitType === "1stTo3rd") {
-            message = "1塁ランナー、2塁を回って3塁へ向かう！";
-            difficulty = 70 + shoulderWeight;
-        }
-        else if (hitType === "ScoreFrom1st") {
-            message = "1塁ランナー、一気にホームを狙う！！";
-            difficulty = 90;
-        }
-        else if (hitType === "HustleDouble") {
-            message = `打った <strong>${runner.name}</strong>、1塁を蹴って2塁へ！`;
-            difficulty = 60;
-        }
-
-        // 深さによる難易度軽減 (より効果的に)
-        let bonusByDepth = (hitDepth - 50);
-        difficulty -= bonusByDepth;
-
-        // リスク評価をより厳格に (difficultyに対して自信がある場合のみ突っ込む)
-        let riskAssessment = runner.stats.speed * 0.8 - (fielder.stats.shoulder * 0.5);
-        if (riskAssessment + (Math.random() * 30) < difficulty * 0.7) return 0;
-
-        this.addLog(`>> ${message}`, "event");
-        let runPoint = (runner.stats.speed * 1.1) + (Math.random() * 30) - difficulty;
-        let defPoint = (fielder.stats.shoulder * 0.9) + (fielder.stats.throwing * 0.2) + (Math.random() * 15);
-
-        if (runPoint > defPoint) {
-            this.addLog(runPoint - defPoint < 15 ? ">> 際どいタイミング... セーフ！！！ ナイスラン！" : ">> 滑り込んだ... 余裕でセーフ！", "event");
-            return 1;
-        } else {
-            if (Math.random() * 100 > (fielder.stats.throwing + 15)) {
-                this.addLog(">> 返球が乱れた！ セーフ！", "event");
-                return 1;
-            }
-            this.addLog(">> 返球が速い！ タッチアウト！ 欲張りすぎた...", "out");
-            return 2;
-        }
-    }
-
-    determineHitType(speed) {
-        let subRoll = Math.random() * 100;
-        let prob3B = speed * 0.05;
-        let prob2B = 10.0 + (speed * 0.1);
-        if (subRoll < prob3B) return 'Triple';
-        if (subRoll < prob3B + prob2B) return 'Double';
-        return 'Single';
-    }
-
-    completeAtBat(res, batter, detail = "", fielder = null, posIndex = -1, hitDepth = 50) {
         this.balls = 0;
         this.strikes = 0;
         let scored = 0;
@@ -701,24 +862,9 @@ class GameState {
                 this.runners = [null, null, null, null];
                 this.addLog("<strong>ホームラン！！！</strong>", "hit");
                 break;
-            case 'Triple':
-                scored = this.advanceRunners(3, batter, fielder, posIndex, hitDepth);
-                this.addLog("<strong>スリーベース！！</strong>", "hit");
-                break;
-            case 'Double':
-                scored = this.advanceRunners(2, batter, fielder, posIndex, hitDepth);
-                this.addLog("<strong>ツーベース！</strong>", "hit");
-                break;
-            case 'Single':
-                scored = this.advanceRunners(1, batter, fielder, posIndex, hitDepth);
-                this.addLog("ヒット！", "hit");
-                break;
             case 'Walk':
                 scored = this.forceAdvance(batter);
                 this.addLog("フォアボールで出塁。", "event");
-                break;
-            case 'Error':
-                scored = this.advanceRunners(1, batter, fielder, posIndex, hitDepth);
                 break;
             case 'Out':
             case 'StrikeOut':
@@ -733,7 +879,6 @@ class GameState {
             this.addLog(`<span style="color:var(--accent-gold)">+${scored}点！</span>`, "event");
         }
 
-        // Check for 3 outs or walk-off
         if (this.inning >= 9 && this.isBottom && this.scoreHome > this.scoreAway) {
             this.gameEnded = true;
             this.updateUI();
@@ -748,63 +893,34 @@ class GameState {
             else this.cpuBatterIdx = (this.cpuBatterIdx + 1) % 9;
         }
 
-        // Reset commands to Auto for next batter
         this.currentCommand = { Pitcher: 'Auto', Batter: 'Auto' };
         this.updateUI();
     }
 
-    advanceRunners(bases, batter, fielder = null, posIndex = -1, hitDepth = 50) {
-        let scored = 0;
-        const newRunners = [null, null, null, null];
-        const isHit = !!fielder;
-
-        // 打者走者の進塁 (頻度を20% -> 10%に下げ、かつriskAssessmentを通す)
-        let batterFinalPos = bases;
-        if (isHit && bases === 1 && Math.random() < 0.1) {
-            const hustleRes = this.checkExtraBase(batter, fielder, "HustleDouble", posIndex, hitDepth);
-            if (hustleRes === 1) batterFinalPos = 2;
-            else if (hustleRes === 2) { this.outs++; batterFinalPos = 0; }
-        }
-
-        for (let i = 3; i >= 1; i--) {
-            if (this.runners[i]) {
-                let currentRunner = this.runners[i];
-                let finalPos = i + bases;
-
-                // 積極走塁判定 (1塁から3塁へ、2塁または1塁からホームへなど)
-                if (isHit && this.outs < 3) {
-                    if (i === 1 && bases === 1) { // 1st to 3rd?
-                        const res = this.checkExtraBase(currentRunner, fielder, "1stTo3rd", posIndex, hitDepth);
-                        if (res === 1) finalPos = 3;
-                        else if (res === 2) { this.outs++; finalPos = 0; }
-                    } else if (i === 1 && bases === 2) { // From 1st to Home?
-                        const res = this.checkExtraBase(currentRunner, fielder, "ScoreFrom1st", posIndex, hitDepth);
-                        if (res === 1) finalPos = 4;
-                        else if (res === 2) { this.outs++; finalPos = 0; }
-                    }
-                }
-
-                if (finalPos >= 4) { if (finalPos > 0) scored++; }
-                else if (finalPos > 0) newRunners[finalPos] = currentRunner;
-            }
-        }
-        if (batterFinalPos > 0 && batterFinalPos < 4) newRunners[batterFinalPos] = batter;
-        else if (batterFinalPos >= 4) scored++;
-
-        this.runners = newRunners;
-        return scored;
-    }
+    advanceRunners(bases, batter) { return 0; } // Obsolete
 
     forceAdvance(batter) {
         let scored = 0;
-        if (this.runners[1]) {
-            if (this.runners[2]) {
-                if (this.runners[3]) scored++;
-                this.runners[3] = this.runners[2];
+        // フォアボール時の押し出し処理 (Runnerクラス対応)
+        // 新しいランナー作成
+        const batterRunner = new Runner(batter, 1);
+
+        let r1 = this.runners[1];
+        let r2 = this.runners[2];
+        let r3 = this.runners[3];
+
+        if (r1) { // 1塁にランナーがいる
+            if (r2) { // 2塁にもいる
+                if (r3) { // 3塁にもいる -> 押し出し
+                    scored++;
+                    this.addLog(`${r3.name}: 押し出しホームイン`, "event");
+                }
+                this.runners[3] = r2; r2.currentBase = 3;
             }
-            this.runners[2] = this.runners[1];
+            this.runners[2] = r1; r1.currentBase = 2;
         }
-        this.runners[1] = batter;
+        this.runners[1] = batterRunner;
+
         return scored;
     }
 
@@ -834,7 +950,30 @@ class GameState {
             this.outs++;
         } else if (r > 98) { // 2% 悪送球
             this.addLog(msg + `<span style="color:var(--error-red)">悪送球！！ランナー進塁！</span>`, "event");
-            this.advanceRunners(1, null);
+
+            // 進塁処理
+            let scored = 0;
+            let nextRunners = [null, null, null, null];
+            for (let i = 3; i >= 1; i--) {
+                if (this.runners[i]) {
+                    let r = this.runners[i];
+                    if (i === 3) {
+                        scored++;
+                        this.addLog(`${r.name}: ホームイン（悪送球）`, "event");
+                    } else {
+                        nextRunners[i + 1] = r;
+                        r.currentBase = i + 1;
+                    }
+                }
+            }
+            this.runners = nextRunners;
+
+            if (scored > 0) {
+                if (this.isBottom) this.scoreHome += scored;
+                else this.scoreAway += scored;
+                this.triggerScoreEffect(scored);
+            }
+
         } else { // 96% 戻る
             this.addLog(msg + "セーフ。", "event");
         }
@@ -947,7 +1086,7 @@ class BaseballSimulation {
     constructor() {
         this.state = new GameState();
         this.teams = [
-            new Team(0, "東京パイレーツ", "東京", "team-red"),
+            new Team(0, "東京ジャイアンツ", "東京", "team-red"),
             new Team(1, "大阪タイガース", "大阪", "team-yellow"),
             new Team(2, "名古屋ドラゴンズ", "名古屋", "team-blue"),
             new Team(3, "福岡ホークス", "福岡", "team-green"),
